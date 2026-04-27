@@ -20,6 +20,11 @@ A Claude Code MCP server that controls the Stata GUI through Windows Stata Autom
 - 支持读取 Stata text log，供 Claude 分析输出结果。
 - 支持读取当前数据结构、缺失情况和样本预览，辅助 Claude 修改 do 文件。
 
+### 演示效果
+
+<video src="https://github.com/shichengg/stata-mcp/assets/demo.mp4" controls="controls" style="max-width: 100%; height: auto;">
+</video>
+
 ### 目录结构
 
 ```text
