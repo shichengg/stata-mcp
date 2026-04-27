@@ -22,7 +22,7 @@ A Claude Code MCP server that controls the Stata GUI through Windows Stata Autom
 
 ### 演示效果
 
-<video src="https://github.com/shichengg/stata-mcp/assets/demo.mp4" controls="controls" style="max-width: 100%; height: auto;">
+<video src="https://github.com/shichengg/stata-mcp/releases/download/v1.0.0/demo.mp4" controls="controls" style="max-width: 100%; height: auto;">
 </video>
 
 ### 目录结构
