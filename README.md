@@ -80,7 +80,7 @@ python -m venv .venv
 pip install mcp pywin32
 ```
 
-3. 注册 Stata Automation。按你的 Stata 安装路径修改命令：
+3. 以管理员身份打开 PowerShell，注册 Stata Automation。按你的 Stata 安装路径修改命令：
 
 ```powershell
 Start-Process -FilePath "D:\Stata18\StataMP-64.exe" -ArgumentList "/Register" -Wait
@@ -89,10 +89,10 @@ Start-Process -FilePath "D:\Stata18\StataMP-64.exe" -ArgumentList "/Register" -W
 4. 验证 COM 是否可用：
 
 ```powershell
-python -c "import win32com.client; s=win32com.client.Dispatch('stata.StataOLEApp'); s.DoCommand('display \"COM OK\"')"
+python -c "import win32com.client; s=win32com.client.Dispatch('stata.StataOLEApp'); s.DoCommand('display 12345')"
 ```
 
-预期结果：Stata GUI 打开或被连接，并显示 `COM OK`。
+预期结果：Stata GUI 打开或被连接，并显示 `12345`。
 
 ### 添加到 Claude Code（推荐）
 
@@ -303,7 +303,7 @@ python -m venv .venv
 pip install mcp pywin32
 ```
 
-3. Register Stata Automation. Adjust the path to your Stata installation:
+3. Open PowerShell as Administrator, then register Stata Automation. Adjust the path to your Stata installation:
 
 ```powershell
 Start-Process -FilePath "D:\Stata18\StataMP-64.exe" -ArgumentList "/Register" -Wait
@@ -312,10 +312,10 @@ Start-Process -FilePath "D:\Stata18\StataMP-64.exe" -ArgumentList "/Register" -W
 4. Verify COM:
 
 ```powershell
-python -c "import win32com.client; s=win32com.client.Dispatch('stata.StataOLEApp'); s.DoCommand('display \"COM OK\"')"
+python -c "import win32com.client; s=win32com.client.Dispatch('stata.StataOLEApp'); s.DoCommand('display 12345')"
 ```
 
-Expected result: the Stata GUI opens or is connected, and displays `COM OK`.
+Expected result: the Stata GUI opens or is connected, and displays `12345`.
 
 ### Add to Claude Code (recommended)
 
