@@ -14,6 +14,7 @@ import concurrent.futures
 import time
 import hashlib
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
@@ -73,6 +74,7 @@ class StataSession:
         pythoncom.CoInitialize()
         self.app = None
         try:
+            _ensure_stata_process()
             self.app = win32com.client.Dispatch(COM_PROG_ID)
             time.sleep(1.5)
             self.app.DoCommand('display "Stata MCP session ready"')
@@ -103,6 +105,34 @@ class StataSession:
 
     def is_ready(self) -> bool:
         return self.ready.is_set() and self.app is not None
+
+
+def _is_stata_process_running() -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "[bool](Get-Process | Where-Object { $_.ProcessName -match '^Stata' })",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        return result.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
+
+def _ensure_stata_process() -> None:
+    if _is_stata_process_running():
+        return
+    if not STATA_EXE.exists():
+        raise FileNotFoundError(f"Stata executable not found: {STATA_EXE}")
+    subprocess.Popen([str(STATA_EXE)], close_fds=True)
+    time.sleep(4)
 
 
 # ── MCP Server ────────────────────────────────────────────────
