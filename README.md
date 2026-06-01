@@ -117,14 +117,19 @@ python -c "import win32com.client; s = win32com.client.Dispatch('stata.StataOLEA
 
 **推荐方案（使用 `claude mcp add` 命令）：**
 
+在 PowerShell 中运行以下命令：
+
 ```powershell
-claude mcp add stata -- python D:\Stata18\mcp\stata_mcp.py
+claude mcp add stata --scope user -- python D:\Stata18\mcp\stata_mcp.py
 ```
 
-> 💡 **提示**：如果 Stata 安装在其他路径，请相应调整为：
+> 💡 **提示**：
+> - `--scope user` 将配置保存到用户级别（可选，默认也是用户级别）
+> - 如果 Stata 安装在其他路径，请相应调整：
 > ```powershell
-> claude mcp add stata -- python "C:\Program Files\Stata18\mcp\stata_mcp.py"
+> claude mcp add stata --scope user -- python "C:\Program Files\Stata18\mcp\stata_mcp.py"
 > ```
+> - 也可在 Claude Code 中直接运行此命令
 
 配置后重启 Claude Code，确认工具列表中出现 `stata` MCP。
 
@@ -425,9 +430,19 @@ python -c "import win32com.client; s = win32com.client.Dispatch('stata.StataOLEA
 
 #### 5. Configure Claude Code
 
+Run the following command in PowerShell:
+
 ```powershell
-claude mcp add stata -- python D:\Stata18\mcp\stata_mcp.py
+claude mcp add stata --scope user -- python D:\Stata18\mcp\stata_mcp.py
 ```
+
+> 💡 **Tips**:
+> - `--scope user` saves the configuration to user level (optional, default is user level)
+> - If Stata is installed elsewhere, adjust the path accordingly:
+> ```powershell
+> claude mcp add stata --scope user -- python "C:\Program Files\Stata18\mcp\stata_mcp.py"
+> ```
+> - You can also run this command directly in Claude Code
 
 Restart Claude Code and verify `stata` appears in the MCP tools list.
 
