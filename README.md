@@ -117,18 +117,29 @@ python -c "import win32com.client; s = win32com.client.Dispatch('stata.StataOLEA
 
 **推荐方案（使用 `claude mcp add` 命令）：**
 
-在 PowerShell 中运行以下命令：
+在 PowerShell 中运行以下命令。首先移除旧配置（如有），然后添加新配置：
 
 ```powershell
+# 移除旧配置（如果存在）
+claude mcp remove stata --scope user
+
+# 标准 Python 环境
 claude mcp add stata --scope user -- python D:\Stata18\mcp\stata_mcp.py
 ```
 
+**如果使用 Conda 环境：**
+
+```powershell
+# 移除旧配置
+claude mcp remove stata --scope user
+
+# 使用 Conda Python
+claude mcp add stata --scope user -- D:/anaconda/python.exe D:\Stata18\mcp\stata_mcp.py
+```
+
 > 💡 **提示**：
-> - `--scope user` 将配置保存到用户级别（可选，默认也是用户级别）
-> - 如果 Stata 安装在其他路径，请相应调整：
-> ```powershell
-> claude mcp add stata --scope user -- python "C:\Program Files\Stata18\mcp\stata_mcp.py"
-> ```
+> - 将 `D:/anaconda` 替换为你的 Conda 安装路径
+> - 如果 Stata 安装在其他路径，相应调整 `D:\Stata18\mcp\stata_mcp.py`
 > - 也可在 Claude Code 中直接运行此命令
 
 配置后重启 Claude Code，确认工具列表中出现 `stata` MCP。
@@ -430,18 +441,29 @@ python -c "import win32com.client; s = win32com.client.Dispatch('stata.StataOLEA
 
 #### 5. Configure Claude Code
 
-Run the following command in PowerShell:
+Run the following commands in PowerShell. First remove old configuration (if exists), then add new configuration:
 
 ```powershell
+# Remove old configuration (if it exists)
+claude mcp remove stata --scope user
+
+# Standard Python environment
 claude mcp add stata --scope user -- python D:\Stata18\mcp\stata_mcp.py
 ```
 
+**If using Conda environment:**
+
+```powershell
+# Remove old configuration
+claude mcp remove stata --scope user
+
+# Use Conda Python
+claude mcp add stata --scope user -- D:/anaconda/python.exe D:\Stata18\mcp\stata_mcp.py
+```
+
 > 💡 **Tips**:
-> - `--scope user` saves the configuration to user level (optional, default is user level)
-> - If Stata is installed elsewhere, adjust the path accordingly:
-> ```powershell
-> claude mcp add stata --scope user -- python "C:\Program Files\Stata18\mcp\stata_mcp.py"
-> ```
+> - Replace `D:/anaconda` with your Conda installation path
+> - If Stata is installed elsewhere, adjust the path accordingly
 > - You can also run this command directly in Claude Code
 
 Restart Claude Code and verify `stata` appears in the MCP tools list.
