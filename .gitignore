@@ -4,3 +4,9 @@ __pycache__/
 *.pyo
 .venv/
 assets/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.stata-mcp/
+docs/
