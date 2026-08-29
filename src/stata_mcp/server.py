@@ -2,7 +2,6 @@
 """
 Stata MCP Server - 通过 Stata Automation COM 控制已打开的 Stata GUI
 用法：python stata_mcp.py
-版本：3.0
 """
 
 import os
@@ -15,22 +14,35 @@ import time
 import hashlib
 import re
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
 # ── 配置 ──────────────────────────────────────────────────────
 MCP_DIR = Path(os.environ.get("STATA_MCP_DIR", Path(__file__).resolve().parents[2]))
-STATA_DIR = Path(os.environ.get("STATA_DIR", MCP_DIR.parent))
-STATA_EXE = Path(os.environ.get("STATA_EXE", STATA_DIR / "StataMP-64.exe"))
 COM_PROG_ID = os.environ.get("STATA_COM_PROG_ID", "stata.StataOLEApp")
+_STATA_EXE_VALUE = os.environ.get("STATA_EXE", "").strip()
+STATA_EXE = Path(_STATA_EXE_VALUE).expanduser() if _STATA_EXE_VALUE else None
+STATA_PROCESS = None
+STATA_EXE_LOCK = threading.RLock()
 
 LOCAL_MCP_DIR_NAME = ".stata-mcp"
 CACHE_DIR_NAME = "cache"
 DOFILES_DIR_NAME = "dofiles"
 TASK_REGISTRY_FILE = "task_registry.json"
+MCP_RUN_LOG_NAME = "__stata_mcp_run"
+MCP_SCHEMA_LOG_NAME = "__stata_mcp_schema"
+DEFAULT_MAX_OUTPUT_CHARS = 200_000
+REGISTRY_FILE_LOCK_TIMEOUT = 10.0
 
 # 危险命令黑名单（安全防护）
 DANGEROUS_COMMANDS = ["!", "shell", "erase", "rm ", "del ", "rmdir", "rd "]
@@ -47,9 +59,11 @@ except Exception as e:
 
 STATA_ERROR = ""
 SESSIONS = {}
+SESSIONS_LOCK = threading.RLock()
 LAST_SESSION_KEY = None
 SESSION_REGISTRIES = {}
 KNOWN_REGISTRY_PATHS = set()
+REGISTRY_LOCK = threading.RLock()
 COM_DISCONNECT_PATTERNS = (
     "RPC 服务器不可用",
     "RPC server is unavailable",
@@ -66,73 +80,104 @@ class StataSession:
         self.key = key
         self.requests = queue.Queue()
         self.ready = threading.Event()
+        self.stopped = threading.Event()
+        self.closing = threading.Event()
+        self.close_lock = threading.Lock()
+        self.transaction_lock = threading.RLock()
         self.error = ""
-        self.thread = threading.Thread(target=self._run, name=f"StataSession-{Path(key).name}", daemon=True)
+        thread_token = hashlib.sha1(key.encode("utf-8", errors="replace")).hexdigest()[:10]
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"StataSession-{thread_token}",
+            daemon=True,
+        )
         self.thread.start()
 
     def _run(self):
-        pythoncom.CoInitialize()
+        com_initialized = False
         self.app = None
         try:
-            _ensure_stata_process()
-            self.app = win32com.client.Dispatch(COM_PROG_ID)
-            time.sleep(1.5)
-            self.app.DoCommand('display "Stata MCP session ready"')
-            self.error = ""
-        except Exception as e:
-            self.error = str(e)
-        finally:
-            self.ready.set()
-
-        while True:
-            command, future = self.requests.get()
-            if command is None:
-                break
             try:
-                if self.app is None:
-                    raise RuntimeError(self.error or "Stata COM session is not ready")
-                self.app.DoCommand(command)
-                future.set_result(True)
-            except Exception as e:
-                future.set_exception(e)
+                pythoncom.CoInitialize()
+                com_initialized = True
+            except Exception as error:
+                self.error = str(error)
+                self.ready.set()
+                return
+
+            try:
+                _start_configured_stata_process()
+                self.app = win32com.client.Dispatch(COM_PROG_ID)
+                time.sleep(1.5)
+                self.app.DoCommand('display "Stata MCP session ready"')
+                self.error = ""
+            except Exception as error:
+                self.error = str(error)
+            finally:
+                self.ready.set()
+
+            while True:
+                command, future = self.requests.get()
+                if command is None:
+                    break
+                try:
+                    if self.app is None:
+                        raise RuntimeError(self.error or "Stata COM session is not ready")
+                    self.app.DoCommand(command)
+                    future.set_result(True)
+                except Exception as error:
+                    future.set_exception(error)
+        finally:
+            self.app = None
+            if com_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+            self.stopped.set()
 
     def execute(self, command: str):
-        if not self.ready.wait(timeout=20):
-            raise RuntimeError("Stata COM session startup timed out")
-        future = concurrent.futures.Future()
-        self.requests.put((command, future))
-        return future.result(timeout=180)
+        with self.transaction_lock:
+            if self.closing.is_set() or self.stopped.is_set():
+                raise RuntimeError("Stata COM session is closing")
+            if not self.ready.wait(timeout=20):
+                raise RuntimeError("Stata COM session startup timed out")
+            future = concurrent.futures.Future()
+            self.requests.put((command, future))
+            return future.result(timeout=180)
+
+    def close(self, timeout: float = 5.0) -> bool:
+        with self.close_lock:
+            if self.stopped.is_set():
+                return True
+            if not self.closing.is_set():
+                self.closing.set()
+                self.requests.put((None, None))
+        if threading.current_thread() is self.thread:
+            return False
+        self.thread.join(timeout=timeout)
+        return not self.thread.is_alive()
 
     def is_ready(self) -> bool:
-        return self.ready.is_set() and self.app is not None
-
-
-def _is_stata_process_running() -> bool:
-    try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                "[bool](Get-Process | Where-Object { $_.ProcessName -match '^Stata' })",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        return (
+            self.ready.is_set()
+            and self.app is not None
+            and not self.closing.is_set()
+            and not self.stopped.is_set()
         )
-        return result.stdout.strip().lower() == "true"
-    except Exception:
-        return False
 
 
-def _ensure_stata_process() -> None:
-    if _is_stata_process_running():
+def _start_configured_stata_process() -> None:
+    global STATA_PROCESS
+    if STATA_EXE is None:
         return
-    if not STATA_EXE.exists():
-        raise FileNotFoundError(f"Stata executable not found: {STATA_EXE}")
-    subprocess.Popen([str(STATA_EXE)], close_fds=True)
-    time.sleep(4)
+    with STATA_EXE_LOCK:
+        if STATA_PROCESS is not None and STATA_PROCESS.poll() is None:
+            return
+        if not STATA_EXE.exists():
+            raise FileNotFoundError(f"Stata executable not found: {STATA_EXE}")
+        STATA_PROCESS = subprocess.Popen([str(STATA_EXE)], close_fds=True)
+        time.sleep(4)
 
 
 # ── MCP Server ────────────────────────────────────────────────
@@ -144,7 +189,7 @@ async def list_tools():
     return [
         Tool(
             name="stata_run",
-            description="在最近的 Stata MCP session_id 对应的 Stata GUI 中执行一条或多条 Stata 命令；可先用 stata_session(action='set_recent') 切换目标 session。",
+            description="在最近的 Stata MCP session 对应 GUI 中将 commands 作为一个完整代码块执行；每次覆盖该 session 的最新运行 text log，并自动返回实际输出。可先用 stata_session(action='set_recent') 切换目标 session。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -160,9 +205,8 @@ async def list_tools():
             name="stata_run_dofile",
             description=(
                 "在 Stata GUI 中运行一个 do 文件。该工具以 session_id 表示一个复现任务/同一个 Stata GUI；"
-                "同一任务的原始 do、检查 do、续跑 do 应使用同一个 session_id。工具会自动在 do 文件所在目录创建 text log，"
-                "默认每个 do 一个日志，文件名包含 do 名和 session_id；不需要在用户 do 文件里手写 log using，"
-                "也不会生成临时 wrapper do 文件。返回 session_id、source_do 和本次 do 的 log_path。"
+                "同一任务的原始 do、检查 do、续跑 do 应使用同一个 session_id。每次调用都会覆盖该 session 在"
+                "项目 .stata-mcp/cache/ 下的最新运行 text log，并自动返回日志内容；不会修改用户原始 do 文件。"
             ),
             inputSchema={
                 "type": "object",
@@ -182,7 +226,7 @@ async def list_tools():
                     },
                     "log_mode": {
                         "type": "string",
-                        "description": "日志写入模式：replace 或 append，默认 replace",
+                        "description": "兼容参数；1.1 版始终使用 replace 覆盖 session 最新运行日志",
                         "enum": ["replace", "append"]
                     }
                 },
@@ -301,7 +345,7 @@ async def list_tools():
         ),
         Tool(
             name="stata_get_results",
-            description="在 Stata GUI 中显示上一次命令的 r() 或 e() 存储结果",
+            description="运行 return list 或 ereturn list，并通过 session 最新运行日志将 r() 或 e() 存储结果直接返回给调用端",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -316,7 +360,7 @@ async def list_tools():
         ),
         Tool(
             name="stata_get_data_info",
-            description="在 Stata GUI 中显示当前数据集的基本信息",
+            description="运行 describe，并通过 session 最新运行日志将当前数据集基本信息直接返回给调用端",
             inputSchema={
                 "type": "object",
                 "properties": {}
@@ -324,7 +368,7 @@ async def list_tools():
         ),
         Tool(
             name="stata_get_data_schema",
-            description="读取当前 Stata 数据集结构、缺失摘要和样本预览，返回给 Claude 分析",
+            description="使用独立且每次覆盖的 schema text log，读取当前 Stata 数据集结构、缺失摘要和样本预览并返回给调用端",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -373,8 +417,8 @@ async def call_tool(name: str, arguments: dict):
 
         elif name == "stata_run_dofile":
             path = _normalize_path_arg(arguments.get("path", ""))
-            if not os.path.exists(path):
-                return [TextContent(type="text", text=f"❌ 文件不存在：{path}")]
+            if not Path(path).is_file():
+                return [TextContent(type="text", text=f"❌ do 文件不存在或不是文件：{path}")]
             session_id = arguments.get("session_id", "")
             role = arguments.get("role", "entry")
             log_mode = arguments.get("log_mode", "replace")
@@ -384,7 +428,10 @@ async def call_tool(name: str, arguments: dict):
         elif name == "stata_session":
             action = arguments.get("action", "list")
             session_id = arguments.get("session_id", "")
-            output = _session_tool(action, session_id)
+            output = await loop.run_in_executor(
+                None,
+                lambda: _session_tool(action, session_id),
+            )
             return [TextContent(type="text", text=output)]
 
         elif name == "stata_write_dofile":
@@ -466,11 +513,6 @@ def _safe_session_id(value: str) -> str:
     return safe or "stata_session"
 
 
-def _safe_file_stem(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("_")
-    return safe or "stata_file"
-
-
 def _project_mcp_dir(do_file_path: Path) -> Path:
     return do_file_path.parent / LOCAL_MCP_DIR_NAME
 
@@ -483,36 +525,101 @@ def _project_dofiles_dir(do_file_path: Path) -> Path:
     return _project_mcp_dir(do_file_path) / DOFILES_DIR_NAME
 
 
+@contextmanager
+def _registry_file_lock(registry_path: Path):
+    if msvcrt is None:
+        yield
+        return
+
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = registry_path.with_name(f"{registry_path.name}.lock")
+    deadline = time.monotonic() + REGISTRY_FILE_LOCK_TIMEOUT
+    with open(lock_path, "a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out acquiring registry lock: {lock_path}"
+                    ) from error
+                time.sleep(0.05)
+
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _registry_transaction(registry_path: Path):
+    with REGISTRY_LOCK:
+        with _registry_file_lock(registry_path):
+            yield
+
+
 def _load_task_registry(registry_path: Path) -> dict:
-    KNOWN_REGISTRY_PATHS.add(str(registry_path))
-    if not registry_path.exists():
-        return {"sessions": {}}
-    try:
-        data = json.loads(registry_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+    with REGISTRY_LOCK:
+        KNOWN_REGISTRY_PATHS.add(str(registry_path))
+        if not registry_path.exists():
             return {"sessions": {}}
-        data.setdefault("sessions", {})
-        return data
-    except Exception:
-        return {"sessions": {}}
+        try:
+            data = json.loads(registry_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"sessions": {}}
+            data.setdefault("sessions", {})
+            return data
+        except Exception:
+            return {"sessions": {}}
 
 
 def _save_task_registry(registry_path: Path, registry: dict) -> None:
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-    registry_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
-    KNOWN_REGISTRY_PATHS.add(str(registry_path))
-
-
-def _get_log_file_path(do_file_path: Path, session_id: str) -> Path:
-    do_stem = _safe_file_stem(do_file_path.stem)
-    safe_session = _safe_session_id(session_id)
-    return do_file_path.parent / f"{do_stem}_{safe_session}_mcp.log"
+    with REGISTRY_LOCK:
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{registry_path.name}.",
+            suffix=".tmp",
+            dir=registry_path.parent,
+        )
+        os.close(file_descriptor)
+        temp_path = Path(temp_name)
+        try:
+            temp_path.write_text(
+                json.dumps(registry, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, registry_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        KNOWN_REGISTRY_PATHS.add(str(registry_path))
 
 
 def _session_key_for_dofile(path: Path, session_id: str) -> str:
     if session_id:
-        return _safe_session_id(session_id)
+        return str(session_id)
     return _normalize_session_key(str(path))
+
+
+def _dispose_session(session_key: str, timeout: float = 5.0) -> bool:
+    with SESSIONS_LOCK:
+        session = SESSIONS.get(session_key)
+    if session is None:
+        return True
+
+    closed = session.close(timeout=timeout)
+    if closed:
+        with SESSIONS_LOCK:
+            if SESSIONS.get(session_key) is session:
+                SESSIONS.pop(session_key, None)
+    return closed
 
 
 def _get_session(session_key: str = None, force_new: bool = False):
@@ -521,18 +628,25 @@ def _get_session(session_key: str = None, force_new: bool = False):
         STATA_ERROR = f"pywin32 未安装或无法导入：{PYWIN32_ERROR}"
         return None
 
-    key = session_key or LAST_SESSION_KEY
+    with SESSIONS_LOCK:
+        key = session_key or LAST_SESSION_KEY
     if not key:
         STATA_ERROR = "还没有 do 文件会话；请先运行一个 do 文件"
         return None
 
-    if force_new and key in SESSIONS:
-        del SESSIONS[key]
-    if key not in SESSIONS:
-        SESSIONS[key] = StataSession(key)
-    LAST_SESSION_KEY = key
+    if force_new and not _dispose_session(key):
+        STATA_ERROR = (
+            f"无法安全停止旧 Stata COM session：{key}；"
+            "旧 worker 仍在结束当前命令，未创建替代 session"
+        )
+        return None
 
-    session = SESSIONS[key]
+    with SESSIONS_LOCK:
+        if key not in SESSIONS:
+            SESSIONS[key] = StataSession(key)
+        session = SESSIONS[key]
+        LAST_SESSION_KEY = key
+
     if not session.ready.wait(timeout=20) or not session.is_ready():
         STATA_ERROR = session.error or "Stata COM session is not ready"
         return None
@@ -540,15 +654,40 @@ def _get_session(session_key: str = None, force_new: bool = False):
     return session
 
 
+@contextmanager
+def _session_transaction(session_key: str = None):
+    while True:
+        session = _get_session(session_key)
+        if session is None:
+            yield None
+            return
+
+        session.transaction_lock.acquire()
+        try:
+            with SESSIONS_LOCK:
+                registered_session = SESSIONS.get(session.key)
+                is_current = registered_session is None or registered_session is session
+            if is_current and session.is_ready():
+                break
+        except Exception:
+            session.transaction_lock.release()
+            raise
+        session.transaction_lock.release()
+
+    try:
+        yield session
+    finally:
+        session.transaction_lock.release()
+
+
 def _is_com_disconnect_error(error: Exception) -> bool:
     text = str(error)
     return any(pattern.lower() in text.lower() for pattern in COM_DISCONNECT_PATTERNS)
 
 
-def _cleanup_disconnected_session(session_id: str, delete_logs: bool = True, extra_log_paths: list[Path] = None) -> None:
+def _cleanup_disconnected_session(session_id: str, delete_logs: bool = False, extra_log_paths: list[Path] = None) -> None:
     global LAST_SESSION_KEY
-    if session_id in SESSIONS:
-        del SESSIONS[session_id]
+    _dispose_session(session_id)
 
     registry_path, registry = _registry_for_session(session_id)
     session_meta = registry.get("sessions", {}).get(session_id, {}) if registry_path else {}
@@ -577,15 +716,26 @@ def _cleanup_disconnected_session(session_id: str, delete_logs: bool = True, ext
             except Exception:
                 pass
 
-    if registry_path and session_id in registry.get("sessions", {}):
-        del registry["sessions"][session_id]
-        _save_task_registry(registry_path, registry)
+    if registry_path:
+        with _registry_transaction(registry_path):
+            latest_registry = _load_task_registry(registry_path)
+            if session_id in latest_registry.get("sessions", {}):
+                latest_registry["sessions"][session_id]["status"] = "disconnected"
+                latest_registry["sessions"][session_id]["updated_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                _save_task_registry(registry_path, latest_registry)
     if LAST_SESSION_KEY == session_id:
         LAST_SESSION_KEY = None
 
 
-def _execute_with_reconnect(session_key: str, command: str, extra_log_paths: list[Path] = None) -> bool:
-    session = _get_session(session_key)
+def _execute_with_reconnect(
+    session_key: str,
+    command: str,
+    extra_log_paths: list[Path] = None,
+    session=None,
+) -> bool:
+    session = session or _get_session(session_key)
     if session is None:
         raise RuntimeError(STATA_ERROR or "Stata COM session is not ready")
     try:
@@ -615,18 +765,19 @@ def _stata_unavailable_message() -> str:
 
 
 def _registry_for_session(session_id: str):
-    registry_path = SESSION_REGISTRIES.get(session_id)
-    if registry_path:
-        path = Path(registry_path)
-        return path, _load_task_registry(path)
+    with REGISTRY_LOCK:
+        registry_path = SESSION_REGISTRIES.get(session_id)
+        if registry_path:
+            path = Path(registry_path)
+            return path, _load_task_registry(path)
 
-    for item in sorted(KNOWN_REGISTRY_PATHS):
-        path = Path(item)
-        registry = _load_task_registry(path)
-        if session_id in registry.get("sessions", {}):
-            SESSION_REGISTRIES[session_id] = str(path)
-            return path, registry
-    return None, {"sessions": {}}
+        for item in sorted(KNOWN_REGISTRY_PATHS):
+            path = Path(item)
+            registry = _load_task_registry(path)
+            if session_id in registry.get("sessions", {}):
+                SESSION_REGISTRIES[session_id] = str(path)
+                return path, registry
+        return None, {"sessions": {}}
 
 
 def _session_metadata(session_id: str) -> dict:
@@ -635,40 +786,49 @@ def _session_metadata(session_id: str) -> dict:
 
 
 def _update_task_registry(session_id: str, registry_path: Path, **metadata) -> dict:
-    registry = _load_task_registry(registry_path)
-    sessions = registry.setdefault("sessions", {})
-    session = sessions.setdefault(session_id, {"session_id": session_id})
-    session.update(metadata)
-    session["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    SESSION_REGISTRIES[session_id] = str(registry_path)
-    _save_task_registry(registry_path, registry)
-    return session
+    with _registry_transaction(registry_path):
+        registry = _load_task_registry(registry_path)
+        sessions = registry.setdefault("sessions", {})
+        session = sessions.setdefault(session_id, {"session_id": session_id})
+        session.update(metadata)
+        session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        SESSION_REGISTRIES[session_id] = str(registry_path)
+        _save_task_registry(registry_path, registry)
+        return session
 
 
 def _register_dofile_run(path: Path, session_id: str, role: str, log_path: Path) -> dict:
-    registry_path = _task_registry_path(path)
-    registry = _load_task_registry(registry_path)
-    sessions = registry.setdefault("sessions", {})
-    session = sessions.setdefault(session_id, {"session_id": session_id})
+    with REGISTRY_LOCK:
+        existing_registry_path = SESSION_REGISTRIES.get(session_id)
+    registry_path = (
+        Path(existing_registry_path)
+        if existing_registry_path
+        else _task_registry_path(path)
+    )
+    with _registry_transaction(registry_path):
+        registry = _load_task_registry(registry_path)
+        sessions = registry.setdefault("sessions", {})
+        session = sessions.setdefault(session_id, {"session_id": session_id})
 
-    if role == "entry" or not session.get("entry_do"):
-        session["entry_do"] = str(path)
-    if role == "source" or not session.get("source_do"):
-        session["source_do"] = str(path)
-    session["current_do"] = str(path)
-    session["working_dir"] = str(path.parent)
-    session["last_log_path"] = str(log_path)
-    session["status"] = "ready"
-    session.setdefault("log_paths", {})[path.name] = str(log_path)
-    session.setdefault("role_history", []).append({
-        "role": role,
-        "path": str(path),
-        "log_path": str(log_path),
-        "at": datetime.now().isoformat(timespec="seconds")
-    })
-    SESSION_REGISTRIES[session_id] = str(registry_path)
-    _save_task_registry(registry_path, registry)
-    return session
+        if role == "entry" or not session.get("entry_do"):
+            session["entry_do"] = str(path)
+        if role == "source" or not session.get("source_do"):
+            session["source_do"] = str(path)
+        session["current_do"] = str(path)
+        session["working_dir"] = str(path.parent)
+        session["last_log_path"] = str(log_path)
+        session["run_log_path"] = str(log_path)
+        session["status"] = "ready"
+        session.setdefault("log_paths", {})[path.name] = str(log_path)
+        session.setdefault("role_history", []).append({
+            "role": role,
+            "path": str(path),
+            "log_path": str(log_path),
+            "at": datetime.now().isoformat(timespec="seconds")
+        })
+        SESSION_REGISTRIES[session_id] = str(registry_path)
+        _save_task_registry(registry_path, registry)
+        return session
 
 
 def _status_text() -> str:
@@ -704,7 +864,7 @@ def _status_text() -> str:
     return (f"Stata MCP 状态：pywin32 {pywin32_status}\n"
             "后端模式：COM / Stata Automation\n"
             f"COM ProgID：{COM_PROG_ID}\n"
-            f"Stata 路径：{STATA_DIR}\n"
+            f"Stata 可执行文件覆盖：{STATA_EXE if STATA_EXE else '未设置（由 COM 注册信息定位）'}\n"
             f"MCP 程序目录：{MCP_DIR}\n"
             "缓存策略：项目/do 文件目录下的 .stata-mcp/cache/task_registry.json；不使用全局缓存或 MCP runtime\n"
             f"会话数量：{len(SESSIONS)}\n"
@@ -716,7 +876,7 @@ def _status_text() -> str:
 def _session_tool(action: str, session_id: str = "") -> str:
     global LAST_SESSION_KEY
     action = action or "list"
-    session_id = _safe_session_id(session_id) if session_id else ""
+    session_id = str(session_id) if session_id else ""
 
     if action == "list":
         data = {
@@ -753,13 +913,19 @@ def _session_tool(action: str, session_id: str = "") -> str:
         return f"✅ 最近 session 已切换为：{session_id}"
 
     if action == "destroy":
-        if session_id in SESSIONS:
-            del SESSIONS[session_id]
+        if not _dispose_session(session_id):
+            return (
+                f"⚠️ session 仍在结束当前命令：{session_id}；"
+                "已拒绝新命令，但 worker 尚未退出，请稍后再次 destroy"
+            )
         registry_path, registry = _registry_for_session(session_id)
-        if registry_path and session_id in registry.get("sessions", {}):
-            registry["sessions"][session_id]["status"] = "destroyed"
-            registry["sessions"][session_id]["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            _save_task_registry(registry_path, registry)
+        if registry_path:
+            with _registry_transaction(registry_path):
+                registry = _load_task_registry(registry_path)
+                if session_id in registry.get("sessions", {}):
+                    registry["sessions"][session_id]["status"] = "destroyed"
+                    registry["sessions"][session_id]["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    _save_task_registry(registry_path, registry)
         if LAST_SESSION_KEY == session_id:
             LAST_SESSION_KEY = None
         return f"✅ 已从 MCP 内存移除 session：{session_id}；未关闭用户的 Stata GUI"
@@ -777,78 +943,182 @@ def _check_safety(commands: str) -> str:
     return ""
 
 
+def _current_working_dir(session_id: str):
+    meta = _session_metadata(session_id)
+    working_dir = meta.get("working_dir")
+    if working_dir:
+        return Path(working_dir)
+    current_do = meta.get("current_do") or meta.get("entry_do") or meta.get("source_do")
+    return Path(current_do).parent if current_do else None
+
+
+def _write_selection_dofile(session_id: str, commands: str) -> Path:
+    cache_dir = _session_cache_dir(session_id)
+    if cache_dir is None:
+        raise RuntimeError("没有当前 session 的项目缓存目录")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_session = _safe_session_id(session_id)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=f"selection_{safe_session}_",
+        suffix=".do",
+        dir=cache_dir,
+        delete=False,
+    ) as handle:
+        handle.write(commands.rstrip() + "\n")
+        return Path(handle.name)
+
+
+def _record_latest_run_log(session_id: str, log_path: Path, status: str = "ready") -> None:
+    registry_path, _ = _registry_for_session(session_id)
+    if registry_path is None:
+        return
+    with _registry_transaction(registry_path):
+        registry = _load_task_registry(registry_path)
+        session = registry.setdefault("sessions", {}).setdefault(
+            session_id,
+            {"session_id": session_id},
+        )
+        session["last_log_path"] = str(log_path)
+        session["run_log_path"] = str(log_path)
+        session["status"] = status
+        session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _save_task_registry(registry_path, registry)
+
+
 def _run_stata_commands(commands: str, session_key: str = None) -> str:
     if not PYWIN32_READY:
         return _stata_unavailable_message()
+    if not commands.strip():
+        return "❌ 没有可执行的 Stata 命令"
 
-    try:
-        session = _get_session(session_key)
+    with _session_transaction(session_key) as session:
         if session is None:
             return _stata_unavailable_message()
 
-        sent = 0
-        for line in commands.splitlines():
-            command = line.strip()
-            if command:
-                reconnected = _execute_with_reconnect(session.key, command)
-                if reconnected:
-                    return ("⚠️ 检测到 Stata GUI/COM 断开；已删除该 session 的旧日志和缓存，"
-                            f"并重新初始化空 Stata GUI：{session.key}。未重放中断命令。")
-                sent += 1
+        log_path = _run_log_path(session.key)
+        working_dir = _current_working_dir(session.key)
+        if log_path is None or working_dir is None:
+            return "❌ 没有当前 session 的项目目录；请先运行 stata_run_dofile"
 
-        if sent == 0:
-            return "❌ 没有可执行的 Stata 命令"
-        return f"✅ 已发送 {sent} 条命令到 Stata 会话执行：{session.key}"
-    except Exception as e:
-        return f"❌ 命令发送失败：{str(e)}"
+        selection_path = None
+        try:
+            selection_path = _write_selection_dofile(session.key, commands)
+            error = _run_dofile_with_log(
+                selection_path,
+                session.key,
+                log_path,
+                working_dir,
+                "replace",
+                session=session,
+            )
+            if error:
+                return error
+            _record_latest_run_log(session.key, log_path)
+            return _format_run_result(session.key, "selection", log_path)
+        except Exception as error:
+            return f"❌ 命令执行失败：{error}"
+        finally:
+            if selection_path is not None:
+                try:
+                    selection_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
-def _run_dofile_session(path: str, session_id: str = "", role: str = "entry", log_mode: str = "replace") -> str:
+def _run_dofile_session(
+    path: str,
+    session_id: str = "",
+    role: str = "entry",
+    log_mode: str = "replace",
+) -> str:
     if not PYWIN32_READY:
         return _stata_unavailable_message()
 
     do_path = Path(path).resolve()
     role = role if role in {"entry", "source", "auxiliary"} else "entry"
-    log_mode = log_mode if log_mode in {"replace", "append"} else "replace"
     session_key = _session_key_for_dofile(do_path, session_id)
-    log_path = _get_log_file_path(do_path, session_key)
+    with _session_transaction(session_key) as session:
+        if session is None:
+            return _stata_unavailable_message()
 
-    output = _run_dofile_with_log(do_path, session_key, log_path, log_mode)
-    if output.startswith("❌") or output.startswith("⚠️"):
-        return output
+        log_path = _run_log_path(session_key, do_path)
+        if log_path is None:
+            return "❌ 无法确定当前 session 的运行日志路径"
 
-    _register_dofile_run(do_path, session_key, role, log_path)
-    return ("✅ 已发送 do 文件到 Stata 会话执行\n"
-            f"session_id: {session_key}\n"
-            f"role: {role}\n"
-            f"source_do: {do_path}\n"
-            f"log_path: {log_path}\n"
-            f"log_mode: {log_mode}\n"
-            "notes: 未生成 wrapper do 文件；日志由 MCP 直接发送 log/do/log close 命令创建")
+        error = _run_dofile_with_log(
+            do_path,
+            session_key,
+            log_path,
+            do_path.parent,
+            "replace",
+            session=session,
+        )
+        if error:
+            return error
+
+        _register_dofile_run(do_path, session_key, role, log_path)
+        return _format_run_result(session_key, "dofile", log_path, do_path)
 
 
-def _run_dofile_with_log(path: Path, session_key: str, log_path: Path, log_mode: str) -> str:
+def _run_dofile_with_log(
+    path: Path,
+    session_key: str,
+    log_path: Path,
+    working_dir: Path,
+    log_mode: str = "replace",
+    session=None,
+) -> str:
+    log_opened = False
+    timed_out = False
+    close_command = f"capture log close {MCP_RUN_LOG_NAME}"
     try:
-        session = _get_session(session_key)
+        session = session or _get_session(session_key)
         if session is None:
             return _stata_unavailable_message()
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         commands = [
-            "capture log close _all",
-            f'log using "{_stata_path(log_path)}", text {log_mode}',
-            f'cd "{_stata_path(path.parent)}"',
+            close_command,
+            f'log using "{_stata_path(log_path)}", text {log_mode} name({MCP_RUN_LOG_NAME})',
+            f'cd "{_stata_path(Path(working_dir))}"',
             f'do "{_stata_path(path)}"',
-            "log close",
+            close_command,
         ]
-        for command in commands:
-            reconnected = _execute_with_reconnect(session_key, command, extra_log_paths=[log_path])
+        for index, command in enumerate(commands):
+            reconnected = _execute_with_reconnect(
+                session_key,
+                command,
+                extra_log_paths=[log_path],
+                session=session,
+            )
+            if index == 1:
+                log_opened = True
             if reconnected:
-                return ("⚠️ 检测到 Stata GUI/COM 断开；已删除该 session 的旧日志和缓存，"
-                        f"并重新初始化空 Stata GUI：{session_key}。未重放中断 do 文件。")
-        return "✅ do 文件命令已发送"
-    except Exception as e:
-        return f"❌ do 文件发送失败：{str(e)}"
+                return (
+                    "⚠️ 检测到 Stata GUI/COM 断开；已保留该 session 的日志和任务记录，"
+                    f"并重新初始化空 Stata GUI：{session_key}。内存状态已丢失，未重放中断命令。"
+                )
+        log_opened = False
+        return ""
+    except TimeoutError as error:
+        timed_out = True
+        if session is not None:
+            session.close(timeout=0)
+        return (
+            "❌ Stata 执行超时；该 session 已停止接收新命令，"
+            f"未创建替代 session：{error}"
+        )
+    except Exception as error:
+        return f"❌ do 文件发送失败：{error}"
+    finally:
+        if log_opened and not timed_out and session is not None:
+            try:
+                session.execute(close_command)
+            except Exception:
+                pass
 
 
 def _write_dofile(content: str, filename: str = "") -> str:
@@ -990,6 +1260,67 @@ def _extract_return_code(text: str):
     return match.group(1) if match else None
 
 
+def _extract_last_return_code(text: str) -> int:
+    matches = re.findall(r"r\((\d+)\);", text or "")
+    return int(matches[-1]) if matches else 0
+
+
+def _max_output_chars() -> int:
+    raw_value = os.environ.get("STATA_MCP_MAX_OUTPUT_CHARS", str(DEFAULT_MAX_OUTPUT_CHARS))
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_OUTPUT_CHARS
+    return max(1, parsed)
+
+
+def _truncate_output(text: str) -> tuple[str, bool]:
+    limit = _max_output_chars()
+    if len(text) <= limit:
+        return text, False
+    return text[-limit:], True
+
+
+def _format_run_result(
+    session_id: str,
+    source: str,
+    log_path: Path,
+    source_do: Path = None,
+) -> str:
+    try:
+        content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except Exception as error:
+        return (
+            "❌ Stata 日志读取失败\n"
+            f"session_id: {session_id}\n"
+            f"source: {source}\n"
+            f"log_path: {log_path}\n"
+            f"error: {error}"
+        )
+
+    return_code = _extract_last_return_code(content)
+    visible_output, truncated = _truncate_output(content)
+    status = "✅ Stata 执行完成" if return_code == 0 else "❌ Stata 执行失败"
+    fields = [
+        status,
+        f"session_id: {session_id}",
+        f"source: {source}",
+    ]
+    if source_do is not None:
+        fields.append(f"source_do: {source_do}")
+    fields.extend([
+        f"log_path: {log_path}",
+        f"return_code: {return_code}",
+        f"output_truncated: {'true' if truncated else 'false'}",
+    ])
+    if truncated:
+        fields.append(
+            f"notice: 输出超过 {_max_output_chars()} 个字符，仅返回末尾；完整内容保留在 log_path"
+        )
+    fields.extend(["", "=== Stata output ===", visible_output])
+    return "\n".join(fields)
+
+
 def _install_package(package: str, source: str = "ssc") -> str:
     if source == "ssc":
         cmd = f"ssc install {package}, replace"
@@ -999,17 +1330,12 @@ def _install_package(package: str, source: str = "ssc") -> str:
 
 
 def _get_stored_results(result_type: str) -> str:
-    if result_type == "r":
-        cmd = "return list"
-    else:
-        cmd = "ereturn list"
-    result = _run_stata_commands(cmd)
-    return f"{result}\n结果已显示在 Stata GUI；如需 Claude 分析，请使用 text log 后调用 stata_read_log。"
+    command = "return list" if result_type == "r" else "ereturn list"
+    return _run_stata_commands(command)
 
 
 def _get_data_info() -> str:
-    result = _run_stata_commands("describe")
-    return f"{result}\n数据信息已显示在 Stata GUI；如需 Claude 分析，请使用 stata_get_data_schema。"
+    return _run_stata_commands("describe")
 
 
 def _safe_log_stem(value: str) -> str:
@@ -1018,33 +1344,66 @@ def _safe_log_stem(value: str) -> str:
     return f"{name}_{digest}"
 
 
+def _session_cache_dir(session_id: str, do_path: Path = None):
+    registry_path = SESSION_REGISTRIES.get(session_id)
+    if registry_path:
+        return Path(registry_path).parent
+    if do_path is not None:
+        return _task_registry_path(Path(do_path).resolve()).parent
+    meta = _session_metadata(session_id)
+    current_do = meta.get("current_do") or meta.get("entry_do") or meta.get("source_do")
+    if not current_do:
+        return None
+    return _task_registry_path(Path(current_do)).parent
+
+
+def _run_log_path(session_id: str, do_path: Path = None):
+    cache_dir = _session_cache_dir(session_id, do_path)
+    if cache_dir is None:
+        return None
+    return cache_dir / f"run_{_safe_log_stem(session_id)}.log"
+
+
 def _get_data_schema(
     sample_rows: int = 20,
     include_codebook: bool = True,
     include_sample: bool = True,
     include_missing: bool = True,
 ) -> str:
-    if not LAST_SESSION_KEY:
-        return _stata_unavailable_message()
+    with _session_transaction() as session:
+        if session is None:
+            return _stata_unavailable_message()
+        return _get_data_schema_locked(
+            session,
+            sample_rows,
+            include_codebook,
+            include_sample,
+            include_missing,
+        )
 
-    session = _get_session()
-    if session is None:
-        return _stata_unavailable_message()
 
+def _get_data_schema_locked(
+    session,
+    sample_rows: int,
+    include_codebook: bool,
+    include_sample: bool,
+    include_missing: bool,
+) -> str:
     try:
         sample_rows = int(sample_rows)
     except Exception:
         sample_rows = 20
     sample_rows = max(1, min(sample_rows, 1000))
 
-    log_path = _schema_log_path()
+    log_path = _schema_log_path(session.key)
     if log_path is None:
         return "❌ 没有最近 session 的项目目录；请先运行 stata_run_dofile，或使用 Stata GUI 手动 describe"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     stata_log_path = _stata_path(log_path)
+    close_command = f"capture log close {MCP_SCHEMA_LOG_NAME}"
     commands = [
-        "capture log close _all",
-        f'log using "{stata_log_path}", text replace',
+        close_command,
+        f'log using "{stata_log_path}", text replace name({MCP_SCHEMA_LOG_NAME})',
         "display \"=== Stata data schema snapshot ===\"",
         "describe",
     ]
@@ -1057,35 +1416,62 @@ def _get_data_schema(
     commands.extend([
         "notes",
         "label dir",
-        "log close",
+        close_command,
     ])
 
     try:
         for command in commands:
-            session.execute(command)
+            reconnected = _execute_with_reconnect(
+                session.key,
+                command,
+                extra_log_paths=[log_path],
+                session=session,
+            )
+            if reconnected:
+                return (
+                    "⚠️ 获取数据结构时 Stata GUI/COM 断开；已保留旧日志和任务记录，"
+                    "新 GUI 为空，未重放快照命令。"
+                )
         return _read_log(str(log_path))
-    except Exception as e:
-        return f"❌ 读取数据结构失败：{str(e)}"
+    except TimeoutError as error:
+        session.close(timeout=0)
+        return (
+            "❌ Stata 数据结构快照执行超时；该 session 已停止接收新命令，"
+            f"未创建替代 session：{error}"
+        )
+    except Exception as error:
+        try:
+            session.execute(close_command)
+        except Exception:
+            pass
+        return f"❌ 读取数据结构失败：{error}"
 
 
-def _schema_log_path():
-    meta = _session_metadata(LAST_SESSION_KEY) if LAST_SESSION_KEY else {}
-    current_do = meta.get("current_do") or meta.get("entry_do") or meta.get("source_do")
-    if not current_do:
+def _schema_log_path(session_id: str = None):
+    if session_id is None:
+        with SESSIONS_LOCK:
+            session_id = LAST_SESSION_KEY
+    if not session_id:
         return None
-    current_path = Path(current_do)
-    return _project_mcp_dir(current_path) / CACHE_DIR_NAME / f"schema_{_safe_log_stem(LAST_SESSION_KEY)}.log"
+    cache_dir = _session_cache_dir(session_id)
+    if cache_dir is None:
+        return None
+    return cache_dir / f"schema_{_safe_log_stem(session_id)}.log"
 
 
 # ── 启动 ──────────────────────────────────────────────────────
-async def main():
+async def serve():
     async with stdio_server() as streams:
         await server.run(
             streams[0],
             streams[1],
-            server.create_initialization_options()
+            server.create_initialization_options(),
         )
 
 
+def main():
+    asyncio.run(serve())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
